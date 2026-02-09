@@ -1,4 +1,131 @@
-# Image Stabilization & Video Creation - Design Document
+((venv) ) sudibyajyotijena@Sudibyas-Mac-mini Video_generation_pipeline % python3 image_comparator.py 20250521170005.JPG 20250522080009.JPG
+
+======================================================================
+COMPARING IMAGES
+======================================================================
+
+Loading images...
+
+Image 1 (20250521170005.JPG): 6000x4000 pixels
+Image 2 (20250522080009.JPG): 6000x4000 pixels
+
+======================================================================
+CROP DETECTION:
+======================================================================
+
+   --- Crop Detection for Image 1 (20250521170005.JPG) ---
+   ✓ Image is NOT cropped (full content)
+
+   --- Crop Detection for Image 2 (20250522080009.JPG) ---
+   ✓ Image is NOT cropped (full content)
+
+======================================================================
+IMAGE QUALITY COMPARISON:
+======================================================================
+
+   --- BRIGHTNESS (0=black, 255=white) ---
+   Image 1: 133.1/255
+   Image 2: 129.3/255
+   Difference: -3.8
+   ✓ Brightness is CONSISTENT
+
+   --- CONTRAST (higher = more contrast) ---
+   Image 1: 41.9
+   Image 2: 45.5
+   Difference: +3.6
+   ✓ Contrast is CONSISTENT
+
+   --- COLOR BALANCE (R/G/B channel averages) ---
+   Image 1: R=132.7  G=133.5  B=132.6
+   Image 2: R=127.2  G=130.4  B=129.3
+   Shift:    R=-5.5      G=-3.0      B=-3.2
+   ⚠ SLIGHT color shift detected
+
+   --- SHARPNESS (higher = sharper) ---
+   Image 1: 41.7
+   Image 2: 71.7
+   Ratio: 1.72x
+   ✗ SIGNIFICANT sharpness difference! (Image 1 is much blurrier)
+     → Will cause BLUR FLICKER in video.
+
+   --- EXPOSURE ---
+   Image 1: Overexposed=0.2%  Underexposed=0.0%
+   Image 2: Overexposed=0.6%  Underexposed=0.0%
+   ✓ Exposure is CONSISTENT
+
+Detecting features...
+Image 1: 1000 features detected
+Image 2: 1000 features detected
+
+Matching features between images...
+Found 388 matching features
+
+======================================================================
+DIFFERENCES FOUND:
+======================================================================
+
+1. SIZE DIFFERENCE:
+   Width:  6000 vs 6000 (difference: +0px)
+   Height: 4000 vs 4000 (difference: +0px)
+
+2. FEATURE COUNT:
+   Image 1: 1000 features
+   Image 2: 1000 features
+   Difference: +0 features
+
+3. FEATURE MATCHING:
+   Matching features: 388
+   Match coverage: 38.8% matched
+
+4. MATCH QUALITY:
+   Best match quality: 10.0/256 (lower is better)
+   Worst match quality: 81.0/256
+   Average quality: 37.2/256
+
+5. SAMPLE MATCHING KEYPOINTS (first 5):
+
+   Match 1:
+     Image 1 position: (4646.6, 3502.7)
+     Image 2 position: (4639.7, 3490.6)
+     Position shift: dx=+6.9px, dy=+12.1px
+     Match quality: 10.0/256
+
+   Match 2:
+     Image 1 position: (2007.0, 2976.0)
+     Image 2 position: (2000.0, 2963.0)
+     Position shift: dx=+7.0px, dy=+13.0px
+     Match quality: 11.0/256
+
+   Match 3:
+     Image 1 position: (4553.0, 3452.0)
+     Image 2 position: (4545.0, 3439.0)
+     Position shift: dx=+8.0px, dy=+13.0px
+     Match quality: 12.0/256
+
+   Match 4:
+     Image 1 position: (2816.0, 3224.0)
+     Image 2 position: (2808.0, 3211.0)
+     Position shift: dx=+8.0px, dy=+13.0px
+     Match quality: 13.0/256
+
+   Match 5:
+     Image 1 position: (3694.5, 2960.1)
+     Image 2 position: (3687.6, 2948.0)
+     Position shift: dx=+6.9px, dy=+12.1px
+     Match quality: 13.0/256
+
+======================================================================
+SUMMARY:
+======================================================================
+
+Average position shift:
+  Horizontal (X): -129.56px
+  Vertical (Y):   +1.10px
+
+✗ Images are MISALIGNED (will cause visible shaking in video)
+
+======================================================================
+((venv) ) sudibyajyotijena@Sudibyas-Mac-mini Video_generation_pipeline % # Image Stabilization & Video Creation - Design Document
 
 **Date:** 2026-02-05
 **Purpose:** Create an algorithm to stabilize/align multiple images and generate a timelapse video
