@@ -10,61 +10,117 @@ import sys
 import os
 
 
+def match_histogram_channel(source, reference):
+    """
+    Match histogram of a single channel from source to reference
+    using CDF (cumulative distribution function) mapping
+    """
+
+    ref_hist, _ = np.histogram(reference.flatten(), 256, [0, 256])
+    src_hist, _ = np.histogram(source.flatten(), 256, [0, 256])
+
+    ref_cdf = ref_hist.cumsum()
+    src_cdf = src_hist.cumsum()
+
+    ref_cdf = ref_cdf / ref_cdf[-1]
+    src_cdf = src_cdf / src_cdf[-1]
+
+    lookup = np.zeros(256, dtype=np.uint8)
+    for val in range(256):
+        closest = np.argmin(np.abs(ref_cdf - src_cdf[val]))
+        lookup[val] = closest
+
+    return lookup[source]
+
+
 def correct_brightness_contrast(image, reference):
     """
-    Match brightness and contrast of image to reference
+    Match brightness and contrast using LAB color space
 
-    Uses histogram matching on each channel to make
-    the image look like the reference in terms of lighting
+    LAB separates luminance (L) from color (A, B):
+    - L channel: Controls brightness and contrast
+    - A channel: Green-Red axis
+    - B channel: Blue-Yellow axis
+
+    By matching only the L channel histogram, we fix brightness
+    and contrast WITHOUT affecting colors.
     """
 
-    result = image.copy()
+    # Convert to LAB
+    img_lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    ref_lab = cv2.cvtColor(reference, cv2.COLOR_BGR2LAB)
 
-    for i in range(3):  # B, G, R channels
-        # Get histograms
-        ref_hist, _ = np.histogram(reference[:, :, i].flatten(), 256, [0, 256])
-        img_hist, _ = np.histogram(image[:, :, i].flatten(), 256, [0, 256])
+    # Match L channel histogram (brightness + contrast)
+    img_lab[:, :, 0] = match_histogram_channel(img_lab[:, :, 0], ref_lab[:, :, 0])
 
-        # Calculate CDFs (cumulative distribution functions)
-        ref_cdf = ref_hist.cumsum()
-        img_cdf = img_hist.cumsum()
-
-        # Normalize CDFs
-        ref_cdf = ref_cdf / ref_cdf[-1]
-        img_cdf = img_cdf / img_cdf[-1]
-
-        # Create lookup table to map image pixels to reference distribution
-        lookup = np.zeros(256, dtype=np.uint8)
-        for pixel_val in range(256):
-            # Find closest matching CDF value in reference
-            closest = np.argmin(np.abs(ref_cdf - img_cdf[pixel_val]))
-            lookup[pixel_val] = closest
-
-        # Apply lookup table
-        result[:, :, i] = lookup[image[:, :, i]]
-
+    # Convert back to BGR
+    result = cv2.cvtColor(img_lab, cv2.COLOR_LAB2BGR)
     return result
 
 
 def correct_color_balance(image, reference):
     """
-    Match color balance of image to reference
-    Adjusts each RGB channel's mean to match the reference
+    Match color balance using LAB color space with FULL histogram matching
+
+    LAB A and B channels control color:
+    - A channel: negative = green, positive = red
+    - B channel: negative = blue, positive = yellow
+
+    Uses CDF histogram matching (not just mean/std) so that
+    EVERY color value is precisely remapped - deep blue stays deep,
+    light blue stays light, matching the reference exactly.
     """
 
-    result = image.astype(np.float64)
+    img_lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    ref_lab = cv2.cvtColor(reference, cv2.COLOR_BGR2LAB)
 
-    for i in range(3):  # B, G, R
-        ref_mean = np.mean(reference[:, :, i])
-        img_mean = np.mean(image[:, :, i])
+    # Full histogram match on A and B channels
+    img_lab[:, :, 1] = match_histogram_channel(img_lab[:, :, 1], ref_lab[:, :, 1])
+    img_lab[:, :, 2] = match_histogram_channel(img_lab[:, :, 2], ref_lab[:, :, 2])
 
-        # Scale factor to match means
-        if img_mean > 0:
-            scale = ref_mean / img_mean
-            result[:, :, i] = result[:, :, i] * scale
+    result = cv2.cvtColor(img_lab, cv2.COLOR_LAB2BGR)
+    return result
 
-    # Clip to valid range
-    result = np.clip(result, 0, 255).astype(np.uint8)
+
+def correct_saturation(image, reference):
+    """
+    Match saturation using HSV color space with FULL histogram matching
+
+    HSV separates:
+    - H (Hue): The actual color (red, green, blue)
+    - S (Saturation): How vivid/muted the color is
+    - V (Value): Brightness
+
+    Uses CDF histogram matching on S channel so that
+    vivid blues stay vivid, muted areas stay muted,
+    matching the reference distribution exactly.
+    """
+
+    img_hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    ref_hsv = cv2.cvtColor(reference, cv2.COLOR_BGR2HSV)
+
+    # Full histogram match on Saturation channel
+    img_hsv[:, :, 1] = match_histogram_channel(img_hsv[:, :, 1], ref_hsv[:, :, 1])
+
+    result = cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR)
+    return result
+
+
+def correct_final_bgr_pass(image, reference):
+    """
+    Final pass: Full BGR histogram matching as catch-all
+
+    After LAB and HSV corrections, there may still be small
+    per-channel differences. This final BGR pass ensures
+    every pixel value in every channel matches the reference
+    distribution exactly.
+    """
+
+    result = image.copy()
+
+    for i in range(3):  # B, G, R channels
+        result[:, :, i] = match_histogram_channel(image[:, :, i], reference[:, :, i])
+
     return result
 
 
@@ -165,10 +221,12 @@ def correct_image(reference_path, image_path, output_path=None):
     Apply all corrections to make image match reference
 
     Corrections applied in order:
-    1. Alignment (position, rotation)
-    2. Color balance
-    3. Brightness & contrast (histogram matching)
-    4. Sharpness
+    1. Alignment (affine translation)
+    2. Brightness & contrast (LAB L-channel histogram matching)
+    3. Color balance & temperature (LAB A+B channel histogram matching)
+    4. Saturation (HSV S-channel histogram matching)
+    5. Final BGR pass (catch-all per-channel histogram matching)
+    6. Sharpness (unsharp mask or Gaussian blur)
 
     Args:
         reference_path: Path to reference image (the "correct" one)
@@ -208,19 +266,9 @@ def correct_image(reference_path, image_path, output_path=None):
     print(f"  Applied homography transformation")
     print(f"  Corrected shift: dx={dx:+.1f}px, dy={dy:+.1f}px")
 
-    # Correction 2: COLOR BALANCE
+    # Correction 2: BRIGHTNESS & CONTRAST (LAB L-channel histogram matching)
     print(f"\n{'='*70}")
-    print("CORRECTION 2: COLOR BALANCE")
-    print(f"{'='*70}")
-    b_before = [np.mean(result[:, :, i]) for i in range(3)]
-    result = correct_color_balance(result, reference)
-    b_after = [np.mean(result[:, :, i]) for i in range(3)]
-    print(f"  Before: R={b_before[2]:.1f} G={b_before[1]:.1f} B={b_before[0]:.1f}")
-    print(f"  After:  R={b_after[2]:.1f} G={b_after[1]:.1f} B={b_after[0]:.1f}")
-
-    # Correction 3: BRIGHTNESS & CONTRAST (histogram matching)
-    print(f"\n{'='*70}")
-    print("CORRECTION 3: BRIGHTNESS & CONTRAST")
+    print("CORRECTION 2: BRIGHTNESS & CONTRAST (LAB color space)")
     print(f"{'='*70}")
     brightness_before = np.mean(cv2.cvtColor(result, cv2.COLOR_BGR2GRAY))
     contrast_before = np.std(cv2.cvtColor(result, cv2.COLOR_BGR2GRAY))
@@ -230,9 +278,54 @@ def correct_image(reference_path, image_path, output_path=None):
     print(f"  Brightness: {brightness_before:.1f} -> {brightness_after:.1f}")
     print(f"  Contrast:   {contrast_before:.1f} -> {contrast_after:.1f}")
 
-    # Correction 4: SHARPNESS
+    # Correction 3: COLOR BALANCE / TEMPERATURE (LAB A+B channels)
     print(f"\n{'='*70}")
-    print("CORRECTION 4: SHARPNESS")
+    print("CORRECTION 3: COLOR BALANCE & TEMPERATURE (LAB color space)")
+    print(f"{'='*70}")
+    img_lab_before = cv2.cvtColor(result, cv2.COLOR_BGR2LAB).astype(np.float64)
+    ref_lab = cv2.cvtColor(reference, cv2.COLOR_BGR2LAB).astype(np.float64)
+    a_before = np.mean(img_lab_before[:, :, 1])
+    b_before = np.mean(img_lab_before[:, :, 2])
+    a_ref = np.mean(ref_lab[:, :, 1])
+    b_ref = np.mean(ref_lab[:, :, 2])
+    print(f"  Before: A(green-red)={a_before:.1f} B(blue-yellow)={b_before:.1f}")
+    print(f"  Target: A(green-red)={a_ref:.1f} B(blue-yellow)={b_ref:.1f}")
+    result = correct_color_balance(result, reference)
+    img_lab_after = cv2.cvtColor(result, cv2.COLOR_BGR2LAB).astype(np.float64)
+    a_after = np.mean(img_lab_after[:, :, 1])
+    b_after = np.mean(img_lab_after[:, :, 2])
+    print(f"  After:  A(green-red)={a_after:.1f} B(blue-yellow)={b_after:.1f}")
+
+    # Correction 4: SATURATION (HSV S-channel)
+    print(f"\n{'='*70}")
+    print("CORRECTION 4: SATURATION (HSV color space)")
+    print(f"{'='*70}")
+    img_hsv_before = cv2.cvtColor(result, cv2.COLOR_BGR2HSV)
+    ref_hsv = cv2.cvtColor(reference, cv2.COLOR_BGR2HSV)
+    sat_before = np.mean(img_hsv_before[:, :, 1])
+    sat_ref = np.mean(ref_hsv[:, :, 1])
+    result = correct_saturation(result, reference)
+    img_hsv_after = cv2.cvtColor(result, cv2.COLOR_BGR2HSV)
+    sat_after = np.mean(img_hsv_after[:, :, 1])
+    print(f"  Before:    {sat_before:.1f}")
+    print(f"  Reference: {sat_ref:.1f}")
+    print(f"  After:     {sat_after:.1f}")
+
+    # Correction 5: FINAL BGR PASS (catch-all)
+    print(f"\n{'='*70}")
+    print("CORRECTION 5: FINAL BGR PASS (catch-all)")
+    print(f"{'='*70}")
+    ref_b, ref_g, ref_r = [np.mean(reference[:, :, i]) for i in range(3)]
+    img_b, img_g, img_r = [np.mean(result[:, :, i]) for i in range(3)]
+    print(f"  Before: R={img_r:.1f} G={img_g:.1f} B={img_b:.1f}")
+    print(f"  Target: R={ref_r:.1f} G={ref_g:.1f} B={ref_b:.1f}")
+    result = correct_final_bgr_pass(result, reference)
+    img_b2, img_g2, img_r2 = [np.mean(result[:, :, i]) for i in range(3)]
+    print(f"  After:  R={img_r2:.1f} G={img_g2:.1f} B={img_b2:.1f}")
+
+    # Correction 6: SHARPNESS
+    print(f"\n{'='*70}")
+    print("CORRECTION 6: SHARPNESS")
     print(f"{'='*70}")
     sharp_before = cv2.Laplacian(cv2.cvtColor(result, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var()
     result, action = correct_sharpness(result, reference)
@@ -273,10 +366,23 @@ def analyze_diff(reference, image):
     sharpness_ref = cv2.Laplacian(ref_gray, cv2.CV_64F).var()
     sharpness_img = cv2.Laplacian(img_gray, cv2.CV_64F).var()
 
-    print(f"  Brightness diff: {brightness_diff:+.1f}")
-    print(f"  Contrast diff:   {contrast_diff:+.1f}")
-    print(f"  Color shift:     R={img_r-ref_r:+.1f} G={img_g-ref_g:+.1f} B={img_b-ref_b:+.1f}")
-    print(f"  Sharpness ratio: {sharpness_img/sharpness_ref:.2f}x")
+    # LAB color temperature
+    ref_lab = cv2.cvtColor(reference, cv2.COLOR_BGR2LAB).astype(np.float64)
+    img_lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float64)
+    temp_a_diff = np.mean(img_lab[:, :, 1]) - np.mean(ref_lab[:, :, 1])
+    temp_b_diff = np.mean(img_lab[:, :, 2]) - np.mean(ref_lab[:, :, 2])
+
+    # HSV saturation
+    ref_hsv = cv2.cvtColor(reference, cv2.COLOR_BGR2HSV)
+    img_hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    sat_diff = np.mean(img_hsv[:, :, 1].astype(float)) - np.mean(ref_hsv[:, :, 1].astype(float))
+
+    print(f"  Brightness diff:  {brightness_diff:+.1f}")
+    print(f"  Contrast diff:    {contrast_diff:+.1f}")
+    print(f"  Color shift:      R={img_r-ref_r:+.1f} G={img_g-ref_g:+.1f} B={img_b-ref_b:+.1f}")
+    print(f"  Color temp (LAB): A={temp_a_diff:+.1f} B={temp_b_diff:+.1f}")
+    print(f"  Saturation diff:  {sat_diff:+.1f}")
+    print(f"  Sharpness ratio:  {sharpness_img/sharpness_ref:.2f}x")
 
 
 def main():

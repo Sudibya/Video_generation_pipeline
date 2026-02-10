@@ -139,6 +139,88 @@ def detect_crop(image, image_name):
     return crop_info
 
 
+def detect_haze(image, image_name):
+    """
+    Detect haze/cloudiness in an image using the Dark Channel Prior.
+
+    How it works:
+    - For each pixel, take the MINIMUM value across R, G, B channels
+    - Then apply a minimum filter (erosion) over a small patch
+    - In a haze-FREE image, most patches have at least one very dark pixel
+      (shadows, dark objects, etc.), so the dark channel is close to 0
+    - In a HAZY image, haze adds a white veil everywhere, so even the
+      darkest pixels are lifted up, making the dark channel bright
+
+    Returns:
+        dict with:
+        - dark_channel_mean: average dark channel intensity (0-255)
+        - haze_density: percentage (0-100%)
+        - is_hazy: True if significant haze detected
+        - level: "clear", "slight", "moderate", "heavy"
+    """
+
+    # Step 1: Compute dark channel
+    # For each pixel, take the minimum across B, G, R
+    min_channel = np.min(image, axis=2)
+
+    # Step 2: Apply minimum filter (erosion) with a patch
+    # Patch size 15x15 works well for typical images
+    patch_size = 15
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (patch_size, patch_size))
+    dark_channel = cv2.erode(min_channel, kernel)
+
+    # Step 3: Measure haze level
+    dc_mean = float(np.mean(dark_channel))
+    dc_median = float(np.median(dark_channel))
+
+    # Percentage of pixels with dark channel > 50 (haze-affected pixels)
+    hazy_pixels = np.sum(dark_channel > 50)
+    total_pixels = dark_channel.shape[0] * dark_channel.shape[1]
+    haze_density = (hazy_pixels / total_pixels) * 100
+
+    # Classify haze level
+    # dc_mean < 30: clear
+    # dc_mean 30-60: slight haze
+    # dc_mean 60-100: moderate haze
+    # dc_mean > 100: heavy haze
+    if dc_mean < 30:
+        level = "clear"
+        is_hazy = False
+    elif dc_mean < 60:
+        level = "slight"
+        is_hazy = True
+    elif dc_mean < 100:
+        level = "moderate"
+        is_hazy = True
+    else:
+        level = "heavy"
+        is_hazy = True
+
+    # Print results
+    print(f"\n   --- Haze Detection for {image_name} ---")
+    if is_hazy:
+        print(f"   ✗ HAZE DETECTED! Level: {level.upper()}")
+        print(f"     Dark channel mean: {dc_mean:.1f}/255 (lower = clearer)")
+        print(f"     Haze density: {haze_density:.1f}% of pixels affected")
+        if level == "heavy":
+            print(f"     → Heavy cloudiness. Will look washed out in video.")
+        elif level == "moderate":
+            print(f"     → Noticeable haze. Colors will appear muted.")
+        else:
+            print(f"     → Mild haze. Slight loss of contrast.")
+    else:
+        print(f"   ✓ Image is CLEAR (no significant haze)")
+        print(f"     Dark channel mean: {dc_mean:.1f}/255")
+
+    return {
+        'dark_channel_mean': dc_mean,
+        'dark_channel_median': dc_median,
+        'haze_density': haze_density,
+        'is_hazy': is_hazy,
+        'level': level
+    }
+
+
 def analyze_image_quality(image, image_name):
     """
     Analyze brightness, contrast, color balance, sharpness, and exposure
@@ -186,6 +268,26 @@ def analyze_image_quality(image, image_name):
     underexposed = np.sum(gray < 15)
     underexposed_pct = (underexposed / (height * width)) * 100
 
+    # 6. HAZE (Dark Channel Prior)
+    min_channel = np.min(image, axis=2)
+    patch_size = 15
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (patch_size, patch_size))
+    dark_channel = cv2.erode(min_channel, kernel)
+    haze_dc_mean = float(np.mean(dark_channel))
+
+    if haze_dc_mean < 30:
+        haze_level = "clear"
+        is_hazy = False
+    elif haze_dc_mean < 60:
+        haze_level = "slight"
+        is_hazy = True
+    elif haze_dc_mean < 100:
+        haze_level = "moderate"
+        is_hazy = True
+    else:
+        haze_level = "heavy"
+        is_hazy = True
+
     quality = {
         'brightness': brightness,
         'contrast': contrast,
@@ -195,6 +297,9 @@ def analyze_image_quality(image, image_name):
         'sharpness': sharpness,
         'overexposed_pct': overexposed_pct,
         'underexposed_pct': underexposed_pct,
+        'haze_dc_mean': haze_dc_mean,
+        'haze_level': haze_level,
+        'is_hazy': is_hazy,
     }
 
     return quality
@@ -318,6 +423,25 @@ def compare_image_quality(quality1, quality2, name1, name2):
             under_img = "Image 2" if quality2['underexposed_pct'] > quality1['underexposed_pct'] else "Image 1"
             print(f"   ⚠ {under_img} has more UNDEREXPOSED (too dark) areas")
 
+    # --- HAZE ---
+    print(f"\n   --- HAZE / CLOUDINESS ---")
+    h1_dc = quality1['haze_dc_mean']
+    h2_dc = quality2['haze_dc_mean']
+    h1_level = quality1['haze_level']
+    h2_level = quality2['haze_level']
+
+    print(f"   Image 1: {h1_level.upper()} (dark channel: {h1_dc:.1f})")
+    print(f"   Image 2: {h2_level.upper()} (dark channel: {h2_dc:.1f})")
+
+    if quality1['is_hazy'] == quality2['is_hazy'] and abs(h1_dc - h2_dc) < 15:
+        print(f"   ✓ Haze level is CONSISTENT")
+    else:
+        hazier = "Image 1" if h1_dc > h2_dc else "Image 2"
+        clearer = "Image 2" if h1_dc > h2_dc else "Image 1"
+        print(f"   ✗ HAZE MISMATCH! {hazier} is hazier than {clearer}")
+        print(f"     Difference: {abs(h1_dc - h2_dc):.1f} dark channel units")
+        print(f"     → Will cause CLARITY FLICKER in video. Needs dehazing.")
+
 
 def compare_images(image1_path, image2_path):
     """
@@ -359,7 +483,20 @@ def compare_images(image1_path, image2_path):
         print(f"\n   ⚠ WARNING: Cropped image(s) detected!")
         print(f"   → Run image_aligner.py to fix before video generation")
 
-    # Analyze image quality (brightness, contrast, color, sharpness, exposure)
+    # Detect haze/cloudiness
+    print(f"\n{'='*70}")
+    print("HAZE DETECTION:")
+    print(f"{'='*70}")
+    haze1 = detect_haze(image1, f"Image 1 ({image1_path})")
+    haze2 = detect_haze(image2, f"Image 2 ({image2_path})")
+
+    if haze1['is_hazy'] or haze2['is_hazy']:
+        if haze1['is_hazy'] != haze2['is_hazy']:
+            hazier = "Image 1" if haze1['dark_channel_mean'] > haze2['dark_channel_mean'] else "Image 2"
+            print(f"\n   ⚠ WARNING: {hazier} is hazy while the other is clear!")
+            print(f"   → Run image_corrector.py to dehaze before video generation")
+
+    # Analyze image quality (brightness, contrast, color, sharpness, exposure, haze)
     quality1 = analyze_image_quality(image1, image1_path)
     quality2 = analyze_image_quality(image2, image2_path)
     compare_image_quality(quality1, quality2, image1_path, image2_path)
@@ -455,6 +592,8 @@ def compare_images(image1_path, image2_path):
         'desc2': desc2,
         'crop1': crop1,
         'crop2': crop2,
+        'haze1': haze1,
+        'haze2': haze2,
         'quality1': quality1,
         'quality2': quality2
     }
