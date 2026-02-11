@@ -288,6 +288,49 @@ def analyze_image_quality(image, image_name):
         haze_level = "heavy"
         is_hazy = True
 
+    # 7. COLOR DEPTH / VIBRANCY
+    # Measures how "deep" or "washed out" colors appear
+    #
+    # Local contrast: Average standard deviation in small patches (32x32)
+    #   High = colors have depth, shadows are dark, highlights are bright
+    #   Low  = flat, washed out, everything looks similar
+    #
+    # Saturation spread: Standard deviation of saturation channel
+    #   High = mix of vivid and muted areas (natural, rich look)
+    #   Low  = everything same saturation (flat, dull look)
+    #
+    # Vivid pixel %: Percentage of pixels with saturation > 100
+    #   High = lots of deep/vivid colors
+    #   Low  = mostly muted/light colors
+
+    # Local contrast (compute std dev in 32x32 patches)
+    patch = 32
+    local_stds = []
+    for y in range(0, height - patch, patch):
+        for x in range(0, width - patch, patch):
+            tile = gray[y:y+patch, x:x+patch]
+            local_stds.append(np.std(tile))
+    local_contrast = float(np.mean(local_stds))
+
+    # Saturation analysis
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    sat_channel = hsv[:, :, 1].astype(float)
+    sat_mean = float(np.mean(sat_channel))
+    sat_std = float(np.std(sat_channel))
+    vivid_pixels = float(np.sum(sat_channel > 100) / (height * width) * 100)
+
+    # Overall color depth score (0-100)
+    # Combines local contrast, saturation spread, and vivid pixel %
+    depth_score = (local_contrast / 80 * 33) + (sat_std / 60 * 33) + (vivid_pixels / 50 * 34)
+    depth_score = min(depth_score, 100.0)
+
+    if depth_score > 60:
+        depth_level = "deep"
+    elif depth_score > 35:
+        depth_level = "moderate"
+    else:
+        depth_level = "light"
+
     quality = {
         'brightness': brightness,
         'contrast': contrast,
@@ -300,6 +343,12 @@ def analyze_image_quality(image, image_name):
         'haze_dc_mean': haze_dc_mean,
         'haze_level': haze_level,
         'is_hazy': is_hazy,
+        'local_contrast': local_contrast,
+        'sat_mean': sat_mean,
+        'sat_std': sat_std,
+        'vivid_pct': vivid_pixels,
+        'depth_score': depth_score,
+        'depth_level': depth_level,
     }
 
     return quality
@@ -441,6 +490,39 @@ def compare_image_quality(quality1, quality2, name1, name2):
         print(f"   ✗ HAZE MISMATCH! {hazier} is hazier than {clearer}")
         print(f"     Difference: {abs(h1_dc - h2_dc):.1f} dark channel units")
         print(f"     → Will cause CLARITY FLICKER in video. Needs dehazing.")
+
+    # --- COLOR DEPTH / VIBRANCY ---
+    print(f"\n   --- COLOR DEPTH / VIBRANCY ---")
+
+    d1 = quality1['depth_score']
+    d2 = quality2['depth_score']
+    dl1 = quality1['depth_level']
+    dl2 = quality2['depth_level']
+
+    print(f"   Image 1: {dl1.upper()} (score: {d1:.1f}/100)")
+    print(f"     Local contrast: {quality1['local_contrast']:.1f}")
+    print(f"     Saturation spread: {quality1['sat_std']:.1f}")
+    print(f"     Vivid pixels: {quality1['vivid_pct']:.1f}%")
+
+    print(f"   Image 2: {dl2.upper()} (score: {d2:.1f}/100)")
+    print(f"     Local contrast: {quality2['local_contrast']:.1f}")
+    print(f"     Saturation spread: {quality2['sat_std']:.1f}")
+    print(f"     Vivid pixels: {quality2['vivid_pct']:.1f}%")
+
+    depth_diff = abs(d1 - d2)
+    if depth_diff < 5:
+        print(f"   ✓ Color depth is CONSISTENT")
+    elif depth_diff < 15:
+        lighter = "Image 2" if d2 < d1 else "Image 1"
+        deeper = "Image 1" if d2 < d1 else "Image 2"
+        print(f"   ⚠ SLIGHT color depth difference ({lighter} has lighter colors)")
+    else:
+        lighter = "Image 2" if d2 < d1 else "Image 1"
+        deeper = "Image 1" if d2 < d1 else "Image 2"
+        print(f"   ✗ SIGNIFICANT color depth difference!")
+        print(f"     {deeper} has DEEPER colors (score: {max(d1,d2):.1f})")
+        print(f"     {lighter} has LIGHTER colors (score: {min(d1,d2):.1f})")
+        print(f"     → Will cause COLOR DEPTH FLICKER in video. Needs local contrast enhancement.")
 
 
 def compare_images(image1_path, image2_path):
