@@ -233,46 +233,117 @@ def correct_color_balance(image, reference):
     return result
 
 
-def correct_saturation(image, reference):
+def correct_saturation(image, reference, strength=0.85):
     """
-    Match saturation using HSV color space with FULL histogram matching
+    Match saturation using HSV color space with BLENDED histogram matching
 
     HSV separates:
     - H (Hue): The actual color (red, green, blue)
     - S (Saturation): How vivid/muted the color is
     - V (Value): Brightness
 
-    Uses CDF histogram matching on S channel so that
-    vivid blues stay vivid, muted areas stay muted,
-    matching the reference distribution exactly.
+    Uses CDF histogram matching on S channel, then blends with the
+    original saturation to prevent over-boosting vibrant areas
+    (e.g., green vegetation becoming unnaturally vivid).
+
+    Args:
+        strength: 0.0 = keep original saturation, 1.0 = full histogram match
+                  Default 0.85 = 85% matched + 15% original (prevents over-saturation)
     """
 
     img_hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     ref_hsv = cv2.cvtColor(reference, cv2.COLOR_BGR2HSV)
 
+    # Save original saturation
+    original_sat = img_hsv[:, :, 1].copy()
+
     # Full histogram match on Saturation channel
-    img_hsv[:, :, 1] = match_histogram_channel(img_hsv[:, :, 1], ref_hsv[:, :, 1])
+    matched_sat = match_histogram_channel(img_hsv[:, :, 1], ref_hsv[:, :, 1])
+
+    # Blend: strength% matched + (1-strength)% original
+    img_hsv[:, :, 1] = np.clip(
+        strength * matched_sat.astype(np.float32) +
+        (1 - strength) * original_sat.astype(np.float32),
+        0, 255
+    ).astype(np.uint8)
 
     result = cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR)
     return result
 
 
-def correct_final_bgr_pass(image, reference):
+def correct_final_bgr_pass(image, reference, strength=0.85):
     """
-    Final pass: Full BGR histogram matching as catch-all
+    Final pass: Blended BGR histogram matching as catch-all
 
     After LAB and HSV corrections, there may still be small
-    per-channel differences. This final BGR pass ensures
-    every pixel value in every channel matches the reference
-    distribution exactly.
+    per-channel differences. This final BGR pass nudges
+    each channel toward the reference distribution.
+
+    Uses blending to prevent compounding over-correction
+    from previous steps (which can over-saturate colors).
+
+    Args:
+        strength: 0.0 = keep current, 1.0 = full histogram match
+                  Default 0.85 = close match without over-correcting
     """
 
     result = image.copy()
 
     for i in range(3):  # B, G, R channels
-        result[:, :, i] = match_histogram_channel(image[:, :, i], reference[:, :, i])
+        matched = match_histogram_channel(image[:, :, i], reference[:, :, i])
+        result[:, :, i] = np.clip(
+            strength * matched.astype(np.float32) +
+            (1 - strength) * image[:, :, i].astype(np.float32),
+            0, 255
+        ).astype(np.uint8)
 
     return result
+
+
+def detect_sky_mask(image):
+    """
+    Detect sky region in the image using brightness and saturation.
+
+    Sky pixels are typically:
+    - High brightness (L > 170 in LAB)
+    - Low saturation (S < 60 in HSV)
+    - Located in the upper portion of the image
+
+    Returns:
+        sky_mask: float32 mask where 1.0 = sky, 0.0 = non-sky
+                  with smooth gradient at the boundary
+    """
+
+    height, width = image.shape[:2]
+
+    # Convert to LAB and HSV
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+    l_channel = lab[:, :, 0]  # Brightness
+    s_channel = hsv[:, :, 1]  # Saturation
+
+    # Sky = bright + low saturation
+    bright_mask = l_channel > 170
+    low_sat_mask = s_channel < 60
+
+    # Combine: must be both bright AND low saturation
+    sky_mask = (bright_mask & low_sat_mask).astype(np.float32)
+
+    # Only consider upper 60% of image as potential sky
+    cutoff_row = int(height * 0.6)
+    sky_mask[cutoff_row:, :] = 0
+
+    # Smooth the mask edges with Gaussian blur for gradual transition
+    sky_mask = cv2.GaussianBlur(sky_mask, (51, 51), 0)
+
+    sky_pixels = np.sum(sky_mask > 0.5)
+    total_pixels = height * width
+    sky_pct = (sky_pixels / total_pixels) * 100
+
+    print(f"  Sky region detected: {sky_pct:.1f}% of image")
+
+    return sky_mask
 
 
 def correct_sharpness(image, reference):
@@ -379,6 +450,7 @@ def correct_image(reference_path, image_path, output_path=None):
     5. Saturation (HSV S-channel histogram matching)
     6. Final BGR pass (catch-all per-channel histogram matching)
     7. Sharpness (unsharp mask or Gaussian blur)
+    8. Sky-aware blending (neutralize yellow tint on clouds/sky)
 
     Args:
         reference_path: Path to reference image (the "correct" one)
@@ -490,6 +562,7 @@ def correct_image(reference_path, image_path, output_path=None):
     print(f"  Before:    {sat_before:.1f}")
     print(f"  Reference: {sat_ref:.1f}")
     print(f"  After:     {sat_after:.1f}")
+    print(f"  Blend:     85% matched + 15% original (close match, no over-saturation)")
 
     # Correction 6: FINAL BGR PASS (catch-all)
     print(f"\n{'='*70}")
@@ -502,6 +575,7 @@ def correct_image(reference_path, image_path, output_path=None):
     result = correct_final_bgr_pass(result, reference)
     img_b2, img_g2, img_r2 = [np.mean(result[:, :, i]) for i in range(3)]
     print(f"  After:  R={img_r2:.1f} G={img_g2:.1f} B={img_b2:.1f}")
+    print(f"  Blend:  85% matched + 15% current (close match, no over-correction)")
 
     # Correction 7: SHARPNESS
     print(f"\n{'='*70}")
@@ -512,6 +586,29 @@ def correct_image(reference_path, image_path, output_path=None):
     sharp_after = cv2.Laplacian(cv2.cvtColor(result, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var()
     print(f"  Action: {action}")
     print(f"  Sharpness: {sharp_before:.1f} -> {sharp_after:.1f}")
+
+    # Correction 7: SKY-AWARE BLENDING (remove yellow tint from clouds)
+    print(f"\n{'='*70}")
+    print("CORRECTION 7: SKY-AWARE BLENDING (neutralize sky tint)")
+    print(f"{'='*70}")
+
+    # Detect sky in the ORIGINAL image (before corrections shifted colors)
+    sky_mask = detect_sky_mask(image)
+
+    # For sky pixels: blend back toward a neutral version
+    # The fully corrected result has yellow tint in sky from global histogram matching
+    # Fix: in sky regions, only keep brightness correction but use original color tone
+    sky_neutral = correct_brightness_contrast(image, reference)  # brightness-only correction
+    sky_neutral, _ = correct_sharpness(sky_neutral, reference)   # match sharpness too
+
+    # Blend: sky regions use neutral version, ground uses full correction
+    sky_mask_3ch = np.stack([sky_mask] * 3, axis=-1)
+    # Sky gets 70% neutral + 30% full correction (keeps some matching but removes tint)
+    sky_blend = cv2.addWeighted(sky_neutral, 0.7, result, 0.3, 0)
+    result = (sky_mask_3ch * sky_blend + (1 - sky_mask_3ch) * result).astype(np.uint8)
+
+    print(f"  Applied neutral color tone to sky region")
+    print(f"  Sky blend: 70% brightness-only + 30% full correction")
 
     # Analyze AFTER corrections
     print(f"\n{'='*70}")
@@ -529,6 +626,231 @@ def correct_image(reference_path, image_path, output_path=None):
     print(f"{'='*70}")
 
     return result
+
+
+def match_histogram_to_average(channel1, channel2):
+    """
+    Compute the average CDF of two channels and map both to it.
+
+    Instead of matching one image to the other, both images are
+    corrected toward a shared midpoint — their average histogram.
+
+    Returns:
+        (corrected_ch1, corrected_ch2)
+    """
+
+    hist1, _ = np.histogram(channel1.flatten(), 256, [0, 256])
+    hist2, _ = np.histogram(channel2.flatten(), 256, [0, 256])
+
+    # Average histogram = midpoint of both distributions
+    avg_hist = (hist1.astype(np.float64) + hist2.astype(np.float64)) / 2.0
+
+    cdf1 = hist1.cumsum().astype(np.float64)
+    cdf2 = hist2.cumsum().astype(np.float64)
+    avg_cdf = avg_hist.cumsum()
+
+    cdf1 = cdf1 / cdf1[-1]
+    cdf2 = cdf2 / cdf2[-1]
+    avg_cdf = avg_cdf / avg_cdf[-1]
+
+    # Map channel1 -> average
+    lookup1 = np.zeros(256, dtype=np.uint8)
+    for val in range(256):
+        lookup1[val] = np.argmin(np.abs(avg_cdf - cdf1[val]))
+
+    # Map channel2 -> average
+    lookup2 = np.zeros(256, dtype=np.uint8)
+    for val in range(256):
+        lookup2[val] = np.argmin(np.abs(avg_cdf - cdf2[val]))
+
+    return lookup1[channel1], lookup2[channel2]
+
+
+def correct_image_pair(image1_path, image2_path, output1_path=None, output2_path=None):
+    """
+    Mutual correction: correct BOTH images toward their average.
+
+    Instead of forcing image2 to match image1 (one-sided), this finds
+    the midpoint of both images and corrects each toward it. Result:
+    both images look virtually identical.
+
+    Corrections applied to both:
+    1. Alignment (image2 aligned to image1, image1 unchanged)
+    2. Brightness & contrast (LAB L-channel -> average)
+    3. Color balance (LAB A+B channels -> average)
+    4. Saturation (HSV S-channel -> average)
+    5. Final BGR pass (per-channel -> average)
+    6. Sharpness (match to average sharpness)
+    7. Sky-aware blending (neutralize tint on clouds)
+    """
+
+    print(f"\n{'='*70}")
+    print("MUTUAL IMAGE CORRECTOR (meet in the middle)")
+    print(f"{'='*70}\n")
+
+    # Load images
+    img1 = cv2.imread(image1_path)
+    img2 = cv2.imread(image2_path)
+
+    if img1 is None or img2 is None:
+        print("Error: Could not load one or both images")
+        return None, None
+
+    h1, w1 = img1.shape[:2]
+    h2, w2 = img2.shape[:2]
+
+    print(f"Image 1: {image1_path} ({w1}x{h1})")
+    print(f"Image 2: {image2_path} ({w2}x{h2})")
+
+    # Analyze BEFORE
+    print(f"\n--- BEFORE CORRECTIONS ---")
+    analyze_diff(img1, img2)
+
+    result1 = img1.copy()
+    result2 = img2.copy()
+
+    # Step 1: ALIGNMENT (align image2 to image1 — only one needs shifting)
+    print(f"\n{'='*70}")
+    print("STEP 1: ALIGNMENT (align Image 2 to Image 1)")
+    print(f"{'='*70}")
+    result2, dx, dy = correct_alignment(result2, result1)
+    print(f"  Corrected shift: dx={dx:+.1f}px, dy={dy:+.1f}px")
+
+    # Step 2: BRIGHTNESS & CONTRAST (LAB L-channel -> average)
+    print(f"\n{'='*70}")
+    print("STEP 2: BRIGHTNESS & CONTRAST (both -> average)")
+    print(f"{'='*70}")
+    lab1 = cv2.cvtColor(result1, cv2.COLOR_BGR2LAB)
+    lab2 = cv2.cvtColor(result2, cv2.COLOR_BGR2LAB)
+    b_before1 = np.mean(lab1[:, :, 0])
+    b_before2 = np.mean(lab2[:, :, 0])
+    lab1[:, :, 0], lab2[:, :, 0] = match_histogram_to_average(lab1[:, :, 0], lab2[:, :, 0])
+    b_after1 = np.mean(lab1[:, :, 0])
+    b_after2 = np.mean(lab2[:, :, 0])
+    result1 = cv2.cvtColor(lab1, cv2.COLOR_LAB2BGR)
+    result2 = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+    print(f"  Image 1 brightness: {b_before1:.1f} -> {b_after1:.1f}")
+    print(f"  Image 2 brightness: {b_before2:.1f} -> {b_after2:.1f}")
+
+    # Step 3: COLOR BALANCE (LAB A+B channels -> average)
+    print(f"\n{'='*70}")
+    print("STEP 3: COLOR BALANCE (both -> average)")
+    print(f"{'='*70}")
+    lab1 = cv2.cvtColor(result1, cv2.COLOR_BGR2LAB)
+    lab2 = cv2.cvtColor(result2, cv2.COLOR_BGR2LAB)
+    a1_before = np.mean(lab1[:, :, 1])
+    a2_before = np.mean(lab2[:, :, 1])
+    lab1[:, :, 1], lab2[:, :, 1] = match_histogram_to_average(lab1[:, :, 1], lab2[:, :, 1])
+    lab1[:, :, 2], lab2[:, :, 2] = match_histogram_to_average(lab1[:, :, 2], lab2[:, :, 2])
+    a1_after = np.mean(lab1[:, :, 1])
+    a2_after = np.mean(lab2[:, :, 1])
+    result1 = cv2.cvtColor(lab1, cv2.COLOR_LAB2BGR)
+    result2 = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+    print(f"  Image 1 color A: {a1_before:.1f} -> {a1_after:.1f}")
+    print(f"  Image 2 color A: {a2_before:.1f} -> {a2_after:.1f}")
+
+    # Step 4: SATURATION (HSV S-channel -> average)
+    print(f"\n{'='*70}")
+    print("STEP 4: SATURATION (both -> average)")
+    print(f"{'='*70}")
+    hsv1 = cv2.cvtColor(result1, cv2.COLOR_BGR2HSV)
+    hsv2 = cv2.cvtColor(result2, cv2.COLOR_BGR2HSV)
+    s1_before = np.mean(hsv1[:, :, 1])
+    s2_before = np.mean(hsv2[:, :, 1])
+    hsv1[:, :, 1], hsv2[:, :, 1] = match_histogram_to_average(hsv1[:, :, 1], hsv2[:, :, 1])
+    s1_after = np.mean(hsv1[:, :, 1])
+    s2_after = np.mean(hsv2[:, :, 1])
+    result1 = cv2.cvtColor(hsv1, cv2.COLOR_HSV2BGR)
+    result2 = cv2.cvtColor(hsv2, cv2.COLOR_HSV2BGR)
+    print(f"  Image 1 saturation: {s1_before:.1f} -> {s1_after:.1f}")
+    print(f"  Image 2 saturation: {s2_before:.1f} -> {s2_after:.1f}")
+
+    # Step 5: FINAL BGR PASS (per-channel -> average)
+    print(f"\n{'='*70}")
+    print("STEP 5: FINAL BGR PASS (both -> average)")
+    print(f"{'='*70}")
+    for i, name in enumerate(['B', 'G', 'R']):
+        before1 = np.mean(result1[:, :, i])
+        before2 = np.mean(result2[:, :, i])
+        result1[:, :, i], result2[:, :, i] = match_histogram_to_average(
+            result1[:, :, i], result2[:, :, i]
+        )
+        after1 = np.mean(result1[:, :, i])
+        after2 = np.mean(result2[:, :, i])
+        print(f"  {name}: Image1 {before1:.1f}->{after1:.1f}  Image2 {before2:.1f}->{after2:.1f}")
+
+    # Step 6: SHARPNESS (match both to average sharpness)
+    print(f"\n{'='*70}")
+    print("STEP 6: SHARPNESS (both -> average)")
+    print(f"{'='*70}")
+    gray1 = cv2.cvtColor(result1, cv2.COLOR_BGR2GRAY)
+    gray2 = cv2.cvtColor(result2, cv2.COLOR_BGR2GRAY)
+    sharp1 = cv2.Laplacian(gray1, cv2.CV_64F).var()
+    sharp2 = cv2.Laplacian(gray2, cv2.CV_64F).var()
+    avg_sharp = (sharp1 + sharp2) / 2
+
+    # Adjust image1 sharpness toward average
+    ratio1 = avg_sharp / sharp1 if sharp1 > 0 else 1.0
+    if ratio1 > 1.2:
+        strength = min(ratio1 - 1.0, 2.0)
+        blurred = cv2.GaussianBlur(result1, (0, 0), 3)
+        result1 = cv2.addWeighted(result1, 1.0 + strength, blurred, -strength, 0)
+        print(f"  Image 1: sharpened ({sharp1:.1f} -> target {avg_sharp:.1f})")
+    elif ratio1 < 0.8:
+        result1 = cv2.GaussianBlur(result1, (3, 3), 0)
+        print(f"  Image 1: blurred ({sharp1:.1f} -> target {avg_sharp:.1f})")
+    else:
+        print(f"  Image 1: no change ({sharp1:.1f}, target {avg_sharp:.1f})")
+
+    # Adjust image2 sharpness toward average
+    ratio2 = avg_sharp / sharp2 if sharp2 > 0 else 1.0
+    if ratio2 > 1.2:
+        strength = min(ratio2 - 1.0, 2.0)
+        blurred = cv2.GaussianBlur(result2, (0, 0), 3)
+        result2 = cv2.addWeighted(result2, 1.0 + strength, blurred, -strength, 0)
+        print(f"  Image 2: sharpened ({sharp2:.1f} -> target {avg_sharp:.1f})")
+    elif ratio2 < 0.8:
+        result2 = cv2.GaussianBlur(result2, (3, 3), 0)
+        print(f"  Image 2: blurred ({sharp2:.1f} -> target {avg_sharp:.1f})")
+    else:
+        print(f"  Image 2: no change ({sharp2:.1f}, target {avg_sharp:.1f})")
+
+    # Step 7: SKY-AWARE BLENDING (for both images)
+    print(f"\n{'='*70}")
+    print("STEP 7: SKY-AWARE BLENDING (neutralize sky tint)")
+    print(f"{'='*70}")
+
+    for label, original, result_img in [("Image 1", img1, result1), ("Image 2", img2, result2)]:
+        print(f"\n  {label}:")
+        sky_mask = detect_sky_mask(original)
+        sky_neutral = correct_brightness_contrast(original, result_img)
+        sky_mask_3ch = np.stack([sky_mask] * 3, axis=-1)
+        sky_blend = cv2.addWeighted(sky_neutral, 0.7, result_img, 0.3, 0)
+        blended = (sky_mask_3ch * sky_blend + (1 - sky_mask_3ch) * result_img).astype(np.uint8)
+        if label == "Image 1":
+            result1 = blended
+        else:
+            result2 = blended
+
+    # Analyze AFTER
+    print(f"\n{'='*70}")
+    print("--- AFTER MUTUAL CORRECTIONS ---")
+    print(f"{'='*70}")
+    analyze_diff(result1, result2)
+
+    # Save
+    if output1_path:
+        cv2.imwrite(output1_path, result1)
+        print(f"\nSaved Image 1 corrected to: {output1_path}")
+    if output2_path:
+        cv2.imwrite(output2_path, result2)
+        print(f"\nSaved Image 2 corrected to: {output2_path}")
+
+    print(f"\n{'='*70}")
+    print("DONE! Both images corrected toward their average.")
+    print(f"{'='*70}")
+
+    return result1, result2
 
 
 def analyze_diff(reference, image):
@@ -571,27 +893,59 @@ def analyze_diff(reference, image):
 
 
 def main():
-    if len(sys.argv) < 3:
-        print("Usage: python3 image_corrector.py <reference_image> <image_to_fix> [output]")
-        print("\nExample:")
-        print("  python3 image_corrector.py 20250521170005.JPG 20250522080009.JPG")
+    # Check for --mutual flag
+    args = [a for a in sys.argv[1:] if a != '--mutual']
+    mutual_mode = '--mutual' in sys.argv
+
+    if len(args) < 2:
+        print("Usage:")
+        print("  python3 image_corrector.py <reference> <image_to_fix> [output]")
+        print("  python3 image_corrector.py --mutual <image1> <image2>")
+        print("\nModes:")
+        print("  Default:  Correct image2 to match image1 (one-sided)")
+        print("  --mutual: Correct BOTH images toward their average (meet in the middle)")
+        print("\nExamples:")
+        print("  python3 image_corrector.py 20221101130004.JPG 20221101140005.JPG")
+        print("  python3 image_corrector.py --mutual 20221101130004.JPG 20221101140005.JPG")
         sys.exit(1)
 
-    reference = sys.argv[1]
-    to_fix = sys.argv[2]
-    output = sys.argv[3] if len(sys.argv) > 3 else os.path.splitext(to_fix)[0] + '_corrected' + os.path.splitext(to_fix)[1]
+    if mutual_mode:
+        image1 = args[0]
+        image2 = args[1]
+        ext1 = os.path.splitext(image1)
+        ext2 = os.path.splitext(image2)
+        output1 = ext1[0] + '_corrected' + ext1[1]
+        output2 = ext2[0] + '_corrected' + ext2[1]
 
-    print("="*70)
-    print("IMAGE CORRECTOR - MATCH TO REFERENCE")
-    print("="*70)
-    print(f"\nReference: {reference}")
-    print(f"To fix:    {to_fix}")
-    print(f"Output:    {output}")
+        print("="*70)
+        print("IMAGE CORRECTOR - MUTUAL MODE (meet in the middle)")
+        print("="*70)
+        print(f"\nImage 1:  {image1}")
+        print(f"Image 2:  {image2}")
+        print(f"Output 1: {output1}")
+        print(f"Output 2: {output2}")
 
-    correct_image(reference, to_fix, output)
+        correct_image_pair(image1, image2, output1, output2)
 
-    print(f"\nVerify:")
-    print(f"  python3 image_comparator.py {reference} {output}")
+        print(f"\nVerify:")
+        print(f"  python3 image_comparator.py {output1} {output2}")
+
+    else:
+        reference = args[0]
+        to_fix = args[1]
+        output = args[2] if len(args) > 2 else os.path.splitext(to_fix)[0] + '_corrected' + os.path.splitext(to_fix)[1]
+
+        print("="*70)
+        print("IMAGE CORRECTOR - MATCH TO REFERENCE")
+        print("="*70)
+        print(f"\nReference: {reference}")
+        print(f"To fix:    {to_fix}")
+        print(f"Output:    {output}")
+
+        correct_image(reference, to_fix, output)
+
+        print(f"\nVerify:")
+        print(f"  python3 image_comparator.py {reference} {output}")
 
 
 if __name__ == "__main__":
